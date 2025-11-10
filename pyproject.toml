@@ -1,0 +1,11 @@
+[project]
+name = "rt-astcenc-glsl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3.4",
+    "pillow>=12.0.0",
+    "wgpu>=0.28.0",
+]

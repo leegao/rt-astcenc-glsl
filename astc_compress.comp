@@ -1,0 +1,311 @@
+#version 450 core
+layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
+
+const uint COLOR_BITS_OPAQUE = 5;  // RANGE_32
+const uint COLOR_BITS_TRANS  = 5;  // RANGE_32
+const uint WEIGHT_BITS_OPAQUE = 5; // RANGE_32
+const uint WEIGHT_BITS_TRANS  = 4; // RANGE_16
+
+layout(std140, binding = 0) uniform CParams {
+    uint g_num_total_blocks;
+};
+
+// Input: Uncompressed pixels (B, 16, 4)
+layout(std430, binding = 1) buffer readonly InBlocks {
+    vec4 g_in_blocks[]; // Accessed as [global_block_id * 16 + pixel_idx]
+};
+
+// Output: Compressed 128-bit blocks
+layout(std430, binding = 2) buffer /*writeonly*/ OutBlocks {
+    uvec4 g_out_compressed_blocks[]; // 4x 32-bit uints = 128 bits
+};
+
+// Output: Decoded 4x4 RGBA8 pixel blocks
+layout(std430, binding = 3) buffer /*writeonly*/ OutDecodedPixels {
+    vec4 g_out_decoded_pixels[]; // Accessed same as g_in_blocks
+};
+
+// 4 blocks * 16 pixels/block = 64 pixels
+shared vec4 s_block_pixels[64];
+
+// 4 blocks * 16 ideal weights/block = 64 weights
+shared float s_ideal_weights[64];
+
+// 4 blocks * 16 final quantized weight indices
+shared uint s_final_q_weights[64];
+
+shared vec4 s_Ea[4];
+shared vec4 s_Eb[4];
+
+shared bool s_is_transparent[4];
+
+shared uvec4 s_packed_block[4];
+
+shared uint s_reduce_alpha_check[64];
+shared vec4 s_reduce_min[64];
+shared vec4 s_reduce_max[64];
+
+
+uint quantize_to_index(float value, uint bits) {
+    if (bits == 0) return 0;
+    float max_val = float((1 << bits) - 1);
+    return uint(round(clamp(value, 0.0, 1.0) * max_val));
+}
+
+float dequantize_from_index(uint index, uint bits) {
+    if (bits == 0) return 0.0;
+    float max_val = float((1 << bits) - 1);
+    return float(index) / max_val;
+}
+
+/**
+ * Writes N bits from a value into a 128-bit (uvec4) block
+ * at a specific bit offset.
+ */
+void set_bits(inout uvec4 block, uint value, uint offset, uint num_bits)
+{
+    if (num_bits == 0 || num_bits > 32) {
+        return;
+    }
+
+    uint mask = (num_bits == 32) ? 0xFFFFFFFF : (1 << num_bits) - 1;
+    uint val_masked = (value & mask);
+
+    uint dword_index = offset / 32;
+    uint bit_in_dword = offset % 32;
+
+    block[dword_index] |= (val_masked << bit_in_dword);
+
+    uint bits_in_first_dword = 32 - bit_in_dword;
+    if (bits_in_first_dword < num_bits)
+    {
+        uint overflow_bits = val_masked >> bits_in_first_dword;
+        block[dword_index + 1] |= overflow_bits;
+    }
+}
+
+uint get_bits(uvec4 block, uint offset, uint num_bits)
+{
+    if (num_bits == 0 || num_bits > 32) {
+        return 0;
+    }
+
+    uint mask = (num_bits == 32) ? 0xFFFFFFFF : (1 << num_bits) - 1;
+
+    uint dword_index = offset / 32;
+    uint bit_in_dword = offset % 32;
+
+    uint value = (block[dword_index] >> bit_in_dword);
+    uint bits_in_first_dword = 32 - bit_in_dword;
+    if (bits_in_first_dword < num_bits)
+    {
+        uint bits_from_next_dword = num_bits - bits_in_first_dword;
+        uint next_dword_mask = (1 << bits_from_next_dword) - 1;
+        uint overflow_bits = (block[dword_index + 1] & next_dword_mask);
+
+        // Combine them
+        value |= (overflow_bits << bits_in_first_dword);
+    }
+
+    return value & mask;
+}
+
+
+uvec4 pack_astc_block_rgba_5_4(vec4 q_Ea, vec4 q_Eb, uint weight_base_index)
+{
+    uvec4 block = uvec4(0, 0, 0, 0);
+    uint offset = 0;
+
+    set_bits(block, 0x054, 0, 11);
+    set_bits(block, 0x0, 11, 2);
+    set_bits(block, 0xD, 13, 4);
+
+    offset = 17;
+
+    uint c_indices[8];
+    c_indices[0] = quantize_to_index(q_Ea.r, 5);
+    c_indices[1] = quantize_to_index(q_Ea.g, 5);
+    c_indices[2] = quantize_to_index(q_Ea.b, 5);
+    c_indices[3] = quantize_to_index(q_Ea.a, 5);
+    c_indices[4] = quantize_to_index(q_Eb.r, 5);
+    c_indices[5] = quantize_to_index(q_Eb.g, 5);
+    c_indices[6] = quantize_to_index(q_Eb.b, 5);
+    c_indices[7] = quantize_to_index(q_Eb.a, 5);
+
+    for (uint i = 0; i < 8; i++) {
+        set_bits(block, c_indices[i], offset, 5);
+        offset += 5;
+    }
+
+    offset = 128;
+    for (uint i = 0; i < 16; i++) {
+        offset -= 4;
+        uint w_idx = s_final_q_weights[weight_base_index + i];
+        set_bits(block, w_idx, offset, 4);
+    }
+
+    return block;
+}
+
+uvec4 pack_astc_block_rgb_5_5(vec3 q_Ea_rgb, vec3 q_Eb_rgb, uint weight_base_index)
+{
+    uvec4 block = uvec4(0, 0, 0, 0);
+    uint offset = 0;
+
+    set_bits(block, 0x05C, 0, 11);
+    set_bits(block, 0x0, 11, 2);
+    set_bits(block, 0x4, 13, 4);
+
+    offset = 17;
+
+    uint c_indices[6];
+    c_indices[0] = quantize_to_index(q_Ea_rgb.r, 5);
+    c_indices[1] = quantize_to_index(q_Ea_rgb.g, 5);
+    c_indices[2] = quantize_to_index(q_Ea_rgb.b, 5);
+    c_indices[3] = quantize_to_index(q_Eb_rgb.r, 5);
+    c_indices[4] = quantize_to_index(q_Eb_rgb.g, 5);
+    c_indices[5] = quantize_to_index(q_Eb_rgb.b, 5);
+
+    for (uint i = 0; i < 6; i++) {
+        set_bits(block, c_indices[i], offset, 5);
+        offset += 5;
+    }
+
+    offset = 128;
+    for (uint i = 0; i < 16; i++) {
+        offset -= 5;
+        uint w_idx = s_final_q_weights[weight_base_index + i];
+        set_bits(block, w_idx, offset, 5);
+    }
+
+    return block;
+}
+
+void main() {
+    uint pixel_idx = gl_LocalInvocationID.x; // 0..15
+    uint block_idx = gl_LocalInvocationID.y; // 0..3
+    uint lane_id = block_idx * 16 + pixel_idx;
+    uint global_block_id = gl_WorkGroupID.x * 4 + block_idx;
+
+    if (global_block_id >= g_num_total_blocks) return;
+
+    s_block_pixels[lane_id] = g_in_blocks[global_block_id * 16 + pixel_idx];
+
+    // Transparency Check
+    float my_alpha = s_block_pixels[lane_id].a;
+    s_reduce_alpha_check[lane_id] = (my_alpha < 0.999f) ? 1 : 0;
+    barrier(); memoryBarrierShared();
+
+    for (uint s = 8; s > 0; s >>= 1) {
+        if (pixel_idx < s) {
+            s_reduce_alpha_check[lane_id] += s_reduce_alpha_check[lane_id + s];
+        }
+        barrier(); memoryBarrierShared();
+    }
+
+    if (pixel_idx == 0) {
+        s_is_transparent[block_idx] = (s_reduce_alpha_check[lane_id] > 0);
+    }
+    barrier(); memoryBarrierShared();
+
+
+    // Endpoint Selection (AABB)
+    s_reduce_min[lane_id] = s_block_pixels[lane_id];
+    s_reduce_max[lane_id] = s_block_pixels[lane_id];
+    barrier(); memoryBarrierShared();
+
+    for (uint s = 8; s > 0; s >>= 1) {
+        if (pixel_idx < s) {
+            s_reduce_min[lane_id] = min(s_reduce_min[lane_id], s_reduce_min[lane_id + s]);
+            s_reduce_max[lane_id] = max(s_reduce_max[lane_id], s_reduce_max[lane_id + s]);
+        }
+        barrier(); memoryBarrierShared();
+    }
+
+    if (pixel_idx == 0) {
+        s_Ea[block_idx] = s_reduce_min[lane_id];
+        s_Eb[block_idx] = s_reduce_max[lane_id];
+    }
+    barrier(); memoryBarrierShared();
+
+
+    // Weight calculation via projection onto Eb-Ea
+    vec4 E_delta = s_Eb[block_idx] - s_Ea[block_idx];
+    float dot_delta = dot(E_delta, E_delta) + 1e-9f;
+    vec4 P = s_block_pixels[lane_id];
+    float proj = dot(P - s_Ea[block_idx], E_delta) / dot_delta;
+    s_ideal_weights[lane_id] = clamp(proj, 0.0, 1.0);
+
+
+    // Quantization
+    bool transparent = s_is_transparent[block_idx];
+    uint weight_bits = transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
+    uint final_q_weight_idx = quantize_to_index(s_ideal_weights[lane_id], weight_bits);
+    s_final_q_weights[lane_id] = final_q_weight_idx;
+    barrier(); memoryBarrierShared();
+
+    // ASTC Packing (TODO)
+    if (pixel_idx == 0) {
+        bool is_final_transparent = s_is_transparent[block_idx];
+        vec4 q_Ea = s_Ea[block_idx];
+        vec4 q_Eb = s_Eb[block_idx];
+        uvec4 packed_block;
+
+        if (is_final_transparent) {
+            packed_block = pack_astc_block_rgba_5_4(q_Ea, q_Eb, lane_id);
+        } else {
+            packed_block = pack_astc_block_rgb_5_5(q_Ea.rgb, q_Eb.rgb, lane_id);
+        }
+
+        g_out_compressed_blocks[global_block_id] = packed_block;
+
+        s_packed_block[block_idx] = packed_block;
+    }
+
+    // DEBUG: write out the full encoded image as rgba8
+    barrier();
+    memoryBarrierShared();
+
+    uvec4 my_packed_block = s_packed_block[block_idx];
+    bool is_decode_transparent = s_is_transparent[block_idx];
+
+    vec4 decoded_Ea, decoded_Eb;
+    uint decoded_weight_idx;
+
+    if (is_decode_transparent) {
+        // Decode RGBA block
+        decoded_Ea.r = dequantize_from_index(get_bits(my_packed_block, 17, 5), 5);
+        decoded_Ea.g = dequantize_from_index(get_bits(my_packed_block, 22, 5), 5);
+        decoded_Ea.b = dequantize_from_index(get_bits(my_packed_block, 27, 5), 5);
+        decoded_Ea.a = dequantize_from_index(get_bits(my_packed_block, 32, 5), 5);
+
+        decoded_Eb.r = dequantize_from_index(get_bits(my_packed_block, 37, 5), 5);
+        decoded_Eb.g = dequantize_from_index(get_bits(my_packed_block, 42, 5), 5);
+        decoded_Eb.b = dequantize_from_index(get_bits(my_packed_block, 47, 5), 5);
+        decoded_Eb.a = dequantize_from_index(get_bits(my_packed_block, 52, 5), 5);
+
+        uint weight_offset = 128 - (pixel_idx + 1) * 4;
+        decoded_weight_idx = get_bits(my_packed_block, weight_offset, 4);
+
+    } else {
+        // Decode RGB block
+        decoded_Ea.r = dequantize_from_index(get_bits(my_packed_block, 17, 5), 5);
+        decoded_Ea.g = dequantize_from_index(get_bits(my_packed_block, 22, 5), 5);
+        decoded_Ea.b = dequantize_from_index(get_bits(my_packed_block, 27, 5), 5);
+        decoded_Ea.a = 1.0f; // Opaque blocks have an implicit alpha of 1.0
+
+        decoded_Eb.r = dequantize_from_index(get_bits(my_packed_block, 32, 5), 5);
+        decoded_Eb.g = dequantize_from_index(get_bits(my_packed_block, 37, 5), 5);
+        decoded_Eb.b = dequantize_from_index(get_bits(my_packed_block, 42, 5), 5);
+        decoded_Eb.a = 1.0f;
+
+        uint weight_offset = 128 - (pixel_idx + 1) * 5;
+        decoded_weight_idx = get_bits(my_packed_block, weight_offset, 5);
+    }
+
+    float w = dequantize_from_index(decoded_weight_idx, weight_bits);
+
+    // LERP the final color
+    vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
+    g_out_decoded_pixels[global_block_id * 16 + pixel_idx] = final_color;
+}
