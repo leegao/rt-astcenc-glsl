@@ -165,3 +165,12 @@ This is yet another segmented reduction to find the min and max of the array, si
         s_packed_block[block_idx] = packed_block;
     }
 ```
+
+### TODO
+
+1. Use PCA color selection - our shader is absolutely not shader-bound right now (that said, the astc packing itself is the biggest source of flops, so that might push us over the edge). If we're excessively memory bound, then using PCA will probably still be hidden behind global memory latency
+2. Change to subgroup primitives instead of coding our own segmented reductions
+3. Try 2-partition (using a 128kb LUT uniform ssbo)
+4. Try dual-plane (alpha-encoding channel)
+
+More sophisticated tricks to increase color diversity (2-p) or fidelity (dual-plane) may not work as well due to heavier quantization needed. I'll need to prototype these in torch first to see if they even increase visual fidelity. Should not heavily regress performance however.
