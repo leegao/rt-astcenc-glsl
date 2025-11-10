@@ -13,6 +13,14 @@ A fundamental tradeoff we'll always have to be wary of is that between color var
 
 wgpu-py is used to run this shader for simplicity
 
+Demo:
+
+**Original**
+![screenshot.jpg](screenshot.jpg)
+
+**ASTC Encoded**
+![decoded_screenshot.jpg](decoded_screenshot.jpg)
+
 ### Stages
 
 #### Setup
