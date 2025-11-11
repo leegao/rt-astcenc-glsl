@@ -37,11 +37,13 @@ async def run_astc_compute(input_data, total_blocks):
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     if adapter is None:
         raise RuntimeError("Could not get a WGPU adapter.")
-
+    
     features = adapter.features
+    print(f"Adapter features: {features}")
+
     if "timestamp-query" not in features:
         raise RuntimeError("Timestamp queries not supported on this adapter. Cannot perform precise timing.")
-    device = adapter.request_device_sync(required_features=["timestamp-query"])
+    device = adapter.request_device_sync(required_features=["timestamp-query", "subgroup", 'subgroup-barrier'])
 
     print(f"Got device: {adapter.summary}")
 

@@ -1,8 +1,8 @@
-#version 450 core
+#version 450
+#extension GL_KHR_shader_subgroup_clustered : require
+
 layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
 
-const uint COLOR_BITS_OPAQUE = 5;  // RANGE_32
-const uint COLOR_BITS_TRANS  = 5;  // RANGE_32
 const uint WEIGHT_BITS_OPAQUE = 5; // RANGE_32
 const uint WEIGHT_BITS_TRANS  = 4; // RANGE_16
 
@@ -16,34 +16,22 @@ layout(std430, binding = 1) buffer readonly InBlocks {
 };
 
 // Output: Compressed 128-bit blocks
-layout(std430, binding = 2) buffer /*writeonly*/ OutBlocks {
+layout(std430, binding = 2) buffer writeonly OutBlocks {
     uvec4 g_out_compressed_blocks[]; // 4x 32-bit uints = 128 bits
 };
 
 // Output: Decoded 4x4 RGBA8 pixel blocks
-layout(std430, binding = 3) buffer /*writeonly*/ OutDecodedPixels {
+layout(std430, binding = 3) buffer writeonly OutDecodedPixels {
     vec4 g_out_decoded_pixels[]; // Accessed same as g_in_blocks
 };
 
 // 4 blocks * 16 pixels/block = 64 pixels
 shared vec4 s_block_pixels[64];
 
-// 4 blocks * 16 ideal weights/block = 64 weights
-shared float s_ideal_weights[64];
-
 // 4 blocks * 16 final quantized weight indices
 shared uint s_final_q_weights[64];
 
-shared vec4 s_Ea[4];
-shared vec4 s_Eb[4];
-
-shared bool s_is_transparent[4];
-
 shared uvec4 s_packed_block[4];
-
-shared uint s_reduce_alpha_check[64];
-shared vec4 s_reduce_min[64];
-shared vec4 s_reduce_max[64];
 
 
 uint quantize_to_index(float value, uint bits) {
@@ -189,69 +177,36 @@ void main() {
 
     if (global_block_id >= g_num_total_blocks) return;
 
+    // Each thread loads a single vec4 pixel
     s_block_pixels[lane_id] = g_in_blocks[global_block_id * 16 + pixel_idx];
+    vec4 my_pixel = s_block_pixels[lane_id];
+    float my_alpha = my_pixel.a;
 
-    // Transparency Check
-    float my_alpha = s_block_pixels[lane_id].a;
-    s_reduce_alpha_check[lane_id] = (my_alpha < 0.999f) ? 1 : 0;
-    barrier(); memoryBarrierShared();
-
-    for (uint s = 8; s > 0; s >>= 1) {
-        if (pixel_idx < s) {
-            s_reduce_alpha_check[lane_id] += s_reduce_alpha_check[lane_id + s];
-        }
-        barrier(); memoryBarrierShared();
-    }
-
-    if (pixel_idx == 0) {
-        s_is_transparent[block_idx] = (s_reduce_alpha_check[lane_id] > 0);
-    }
-    barrier(); memoryBarrierShared();
-
-
-    // Endpoint Selection (AABB)
-    s_reduce_min[lane_id] = s_block_pixels[lane_id];
-    s_reduce_max[lane_id] = s_block_pixels[lane_id];
-    barrier(); memoryBarrierShared();
-
-    for (uint s = 8; s > 0; s >>= 1) {
-        if (pixel_idx < s) {
-            s_reduce_min[lane_id] = min(s_reduce_min[lane_id], s_reduce_min[lane_id + s]);
-            s_reduce_max[lane_id] = max(s_reduce_max[lane_id], s_reduce_max[lane_id + s]);
-        }
-        barrier(); memoryBarrierShared();
-    }
-
-    if (pixel_idx == 0) {
-        s_Ea[block_idx] = s_reduce_min[lane_id];
-        s_Eb[block_idx] = s_reduce_max[lane_id];
-    }
-    barrier(); memoryBarrierShared();
-
+    // Endpoint Selection (AABB) via clustered subgroup min/max
+    vec4 Ea = subgroupClusteredMin(my_pixel, 16);
+    vec4 Eb = subgroupClusteredMax(my_pixel, 16);
 
     // Weight calculation via projection onto Eb-Ea
-    vec4 E_delta = s_Eb[block_idx] - s_Ea[block_idx];
+    vec4 E_delta = Eb - Ea;
     float dot_delta = dot(E_delta, E_delta) + 1e-9f;
     vec4 P = s_block_pixels[lane_id];
-    float proj = dot(P - s_Ea[block_idx], E_delta) / dot_delta;
-    s_ideal_weights[lane_id] = clamp(proj, 0.0, 1.0);
-
+    float proj = dot(P - Ea, E_delta) / dot_delta;
+    proj = clamp(proj, 0.0, 1.0);
 
     // Quantization
-    bool transparent = s_is_transparent[block_idx];
-    uint weight_bits = transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
-    uint final_q_weight_idx = quantize_to_index(s_ideal_weights[lane_id], weight_bits);
+    bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
+    uint weight_bits = is_transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
+    uint final_q_weight_idx = quantize_to_index(proj, weight_bits);
     s_final_q_weights[lane_id] = final_q_weight_idx;
     barrier(); memoryBarrierShared();
 
     // ASTC Packing (TODO)
     if (pixel_idx == 0) {
-        bool is_final_transparent = s_is_transparent[block_idx];
-        vec4 q_Ea = s_Ea[block_idx];
-        vec4 q_Eb = s_Eb[block_idx];
+        vec4 q_Ea = Ea;
+        vec4 q_Eb = Eb;
         uvec4 packed_block;
 
-        if (is_final_transparent) {
+        if (is_transparent) {
             packed_block = pack_astc_block_rgba_5_4(q_Ea, q_Eb, lane_id);
         } else {
             packed_block = pack_astc_block_rgb_5_5(q_Ea.rgb, q_Eb.rgb, lane_id);
@@ -267,12 +222,11 @@ void main() {
     memoryBarrierShared();
 
     uvec4 my_packed_block = s_packed_block[block_idx];
-    bool is_decode_transparent = s_is_transparent[block_idx];
 
     vec4 decoded_Ea, decoded_Eb;
     uint decoded_weight_idx;
 
-    if (is_decode_transparent) {
+    if (is_transparent) {
         // Decode RGBA block
         decoded_Ea.r = dequantize_from_index(get_bits(my_packed_block, 17, 5), 5);
         decoded_Ea.g = dequantize_from_index(get_bits(my_packed_block, 22, 5), 5);
