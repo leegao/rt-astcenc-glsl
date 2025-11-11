@@ -9,6 +9,7 @@ const uint WEIGHT_BITS_TRANS  = 4; // RANGE_16
 
 layout(std140, binding = 0) uniform CParams {
     uint g_num_total_blocks;
+    uint g_use_pca;
 };
 
 // Input: Uncompressed pixels (B, 16, 4)
@@ -160,6 +161,55 @@ void pack_astc_block_parallel_rgb(uint block_idx, uint weight_base_index)
     set_bits_atomic_shared(block_idx, w_idx, w_offset, 5);
 }
 
+vec4 RGB_to_YCoCg(vec4 rgb) {
+    float Y  =  0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b;
+    float Co =  0.5  * rgb.r               - 0.5  * rgb.b;
+    float Cg = -0.25 * rgb.r + 0.5 * rgb.g - 0.25 * rgb.b;
+    return vec4(Y, Co, Cg, rgb.a);
+}
+
+vec4 YCoCg_to_RGB(vec4 ycocg) {
+    float Y  = ycocg.x;
+    float Co = ycocg.y;
+    float Cg = ycocg.z;
+    float R = Y + Co - Cg;
+    float G = Y + Cg;
+    float B = Y - Co - Cg;
+    return vec4(R, G, B, ycocg.w);
+}
+
+void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb) {
+    // We will do PCA within the luma space, prioritizing Y (luma) specifically
+    vec4 pixel_ycocg = RGB_to_YCoCg(my_pixel);
+    const vec4 kYCoCgScale = vec4(1.5, 1.0, 1.0, 1.0); 
+
+    vec4 sumPixels = subgroupClusteredAdd(pixel_ycocg, 16);
+    vec4 mean = sumPixels / 16.0;
+    
+    // Center and Scale
+    vec4 centered = pixel_ycocg - mean;
+    vec4 scaledCentered = centered * kYCoCgScale;
+
+    // matrix-free power iteration
+    vec4 dir = normalize(vec4(1.0)); 
+    for (int i = 0; i < 4; ++i) {
+        vec4 contribution = scaledCentered * dot(scaledCentered, dir);
+        vec4 newDir = subgroupClusteredAdd(contribution, 16);
+        if (dot(newDir, newDir) > 1e-6) dir = normalize(newDir);
+    }
+
+    float projection = dot(scaledCentered, dir);
+    float minProj = subgroupClusteredMin(projection, 16);
+    float maxProj = subgroupClusteredMax(projection, 16);
+
+    vec4 unscaledDir = dir / kYCoCgScale;
+    vec4 p1_YCoCg = mean + unscaledDir * minProj;
+    vec4 p2_YCoCg = mean + unscaledDir * maxProj;
+    
+    // Reproject back to rgb
+    Ea = YCoCg_to_RGB(p1_YCoCg);
+    Eb = YCoCg_to_RGB(p2_YCoCg);
+}
 
 void main() {
     uint pixel_idx = gl_LocalInvocationID.x; // 0..15
@@ -175,8 +225,13 @@ void main() {
     barrier(); // Ensure every thread finishes fetching my_pixel
 
     // Endpoint Selection (AABB) via clustered subgroup min/max
-    vec4 Ea = subgroupClusteredMin(my_pixel, 16);
-    vec4 Eb = subgroupClusteredMax(my_pixel, 16);
+    vec4 Ea, Eb;
+    if (g_use_pca > 0) {
+        pca_ycocg_endpoint_selection(my_pixel, Ea, Eb);
+    } else {
+        Ea = subgroupClusteredMin(my_pixel, 16);
+        Eb = subgroupClusteredMax(my_pixel, 16);
+    }
 
     // Weight calculation via projection onto Eb-Ea
     vec4 E_delta = Eb - Ea;

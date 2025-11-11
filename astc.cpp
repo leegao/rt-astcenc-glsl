@@ -351,7 +351,7 @@ public:
     }
     
     void createBuffers() {
-        VkDeviceSize uniformBufferSize = sizeof(uint32_t);
+        VkDeviceSize uniformBufferSize = 2 * sizeof(uint32_t);
         VkDeviceSize inputPixelBufferSize = imageData.tiledData.size() * sizeof(float);
         
         createBuffer(uniformBufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, uniformBuffer, uniformBufferMemory);
@@ -366,7 +366,8 @@ public:
         createBuffer(uniformBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
         void* data;
         vkMapMemory(device, stagingBufferMemory, 0, uniformBufferSize, 0, &data);
-        memcpy(data, &imageData.totalBlocks, uniformBufferSize);
+        memcpy(data, &imageData.totalBlocks, sizeof(uint32_t));
+        (static_cast<uint32_t*>(data))[1] = 1; // Use PCA
         vkUnmapMemory(device, stagingBufferMemory);
         copyBuffer(stagingBuffer, uniformBuffer, uniformBufferSize);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
@@ -495,7 +496,7 @@ public:
         allocInfo.pSetLayouts = &descriptorSetLayout;
         VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet));
 
-        VkDescriptorBufferInfo uniformBufferInfo = {uniformBuffer, 0, sizeof(uint32_t)};
+        VkDescriptorBufferInfo uniformBufferInfo = {uniformBuffer, 0, 2 * sizeof(uint32_t)};
         VkDescriptorBufferInfo inputPixelBufferInfo = {inputPixelBuffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo compressedBufferInfo = {compressedBuffer, 0, VK_WHOLE_SIZE};
         VkDescriptorBufferInfo decodedBufferInfo = {decodedBuffer, 0, VK_WHOLE_SIZE};
