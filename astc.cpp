@@ -398,10 +398,17 @@ public:
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(copyCmdBuffer, &beginInfo);
+
+        vkCmdResetQueryPool(copyCmdBuffer, queryPool, 0, 2);
+
+        // Start timestamp
+        vkCmdWriteTimestamp(copyCmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
         
         VkBufferCopy copyRegion = {};
         copyRegion.size = size;
         vkCmdCopyBuffer(copyCmdBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        vkCmdWriteTimestamp(copyCmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 1);
         
         vkEndCommandBuffer(copyCmdBuffer);
 
@@ -411,6 +418,27 @@ public:
         submitInfo.pCommandBuffers = &copyCmdBuffer;
         vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue);
+
+        uint64_t timestamps[2];
+        VK_CHECK_RESULT(vkGetQueryPoolResults(
+            device,
+            queryPool,
+            0, // first query
+            2, // query count
+            sizeof(timestamps),
+            &timestamps,
+            sizeof(uint64_t), // stride
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+
+        uint64_t startTime = timestamps[0];
+        uint64_t endTime = timestamps[1];
+        uint64_t duration_ticks = endTime - startTime;
+        double duration_ns = duration_ticks * timestampPeriod;
+        double duration_ms = duration_ns * 1e-6;
+
+        std::cout << "----------------------------------------" << std::endl;
+        std::cout << "GPU buffer copy time: " << duration_ms << " ms" << std::endl;
+        std::cout << "----------------------------------------" << std::endl;
 
         vkFreeCommandBuffers(device, commandPool, 1, &copyCmdBuffer);
     }
@@ -544,7 +572,7 @@ public:
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK_RESULT(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
-        vkCmdResetQueryPool(commandBuffer, queryPool, 0, 2);
+        vkCmdResetQueryPool(commandBuffer, queryPool, 0, 5);
 
         // Start timestamp
         vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
@@ -612,13 +640,13 @@ public:
         uint64_t duration_ticks = endTime - startTime;
         double duration_ns = duration_ticks * timestampPeriod;
         double duration_ms = duration_ns * 1e-6;
-        #define TIME(n) ((timestamps[n] - timestamps[0]) * timestampPeriod * 1e-6)
+        #define TIME(n) ((timestamps[n] - timestamps[n-1]) * timestampPeriod * 1e-6)
 
         std::cout << "----------------------------------------" << std::endl;
         std::cout << "GPU to dispatch time: " << TIME(1) << " ms" << std::endl;
         std::cout << "GPU to barrier time: " << TIME(2) << " ms" << std::endl;
-        std::cout << "GPU to copy buffer 1 time: " << TIME(3) << " ms" << std::endl;
-        std::cout << "GPU to copy buffer 2 time: " << TIME(4) << " ms" << std::endl;
+        std::cout << "GPU to copy astc output buffer time: " << TIME(3) << " ms" << std::endl;
+        std::cout << "GPU to copy decoded output buffer time: " << TIME(4) << " ms" << std::endl;
         std::cout << "----------------------------------------" << std::endl;
 
         std::cout << "GPU execution finished." << std::endl;

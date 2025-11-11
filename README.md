@@ -11,13 +11,67 @@ The ASTC encoder (in astc_compress.comp, written in glsl) tries to do an extreme
 
 A fundamental tradeoff we'll always have to be wary of is that between color variety and color fidelity. Meaning, there's a fundamental tradeoff due to the limited block size (128b) between how many visually distinct colors you can represent within the 4x4 area versus how accurate you represent those colors.
 
-Demo:
+### Demo
 
 **Original**
 ![screenshot.jpg](screenshot.jpg)
 
 **ASTC Encoded**
 ![decoded_screenshot.png](decoded_screenshot.png)
+
+**With parallelized astc packing**
+
+```bash
+$ sh run.sh 
+astc_compress.comp
+Using device: AMD Radeon Graphics (RADV RENOIR)
+Device timestamp period: 10 ns
+Uploading uniform data...
+----------------------------------------
+GPU buffer copy time: 0.00105 ms
+----------------------------------------
+Uploading pixel data...
+----------------------------------------
+GPU buffer copy time: 0.0012 ms
+----------------------------------------
+Submitting...
+Completed...
+----------------------------------------
+GPU to dispatch time: 2.29248 ms
+GPU to barrier time: 0.01144 ms
+GPU to copy astc output buffer time: 0.13944 ms
+GPU to copy decoded output buffer time: 1.85716 ms
+----------------------------------------
+GPU execution finished.
+```
+
+**Without parallelized astc packing**
+
+```
+$ sh run.sh 
+astc_compress.comp
+Using device: AMD Radeon Graphics (RADV RENOIR)
+Device timestamp period: 10 ns
+Uploading uniform data...
+----------------------------------------
+GPU buffer copy time: 0.0011 ms
+----------------------------------------
+Uploading pixel data...
+----------------------------------------
+GPU buffer copy time: 0.0012 ms
+----------------------------------------
+Submitting...
+Completed...
+----------------------------------------
+GPU to dispatch time: 2.34636 ms
+GPU to barrier time: 0.01388 ms
+GPU to copy astc output buffer time: 0.13948 ms
+GPU to copy decoded output buffer time: 2.17108 ms
+----------------------------------------
+GPU execution finished.
+```
+
+As you can see, there's no appreciable difference in the actual compute shader time. In fact, it's suspiciously similar to that final device-to-host IO time, which suggests that micro-optimizing the shader to reduce stalls / increase occupancy isn't worth it because we're just completely dominated by the IO latency due to low gobal memory bandwidth.
 
 ### Stages
 
@@ -110,5 +164,6 @@ This has been replaced by a pair of subgroupClusteredMin/Max operations
 3. Try 2-partition (using a 128kb LUT uniform ssbo)
 4. Try dual-plane (alpha-encoding channel)
 5. Try a greedy Ep selection algorithm
+6. ~Add parallelized astc format packing~
 
 More sophisticated tricks to increase color diversity (2-p) or fidelity (dual-plane) may not work as well due to heavier quantization needed. I'll need to prototype these in torch first to see if they even increase visual fidelity. Should not heavily regress performance however.
