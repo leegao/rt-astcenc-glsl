@@ -32,7 +32,11 @@ shared vec4 s_block_pixels[64];
 // 4 blocks * 16 final quantized weight indices
 shared uint s_final_q_weights[64];
 
+// 4 blocks * 128b (4 uvecs) for the final packed astc block
 shared uvec4 s_packed_block[4];
+
+// 4 blocks * 8 endpoint channels as a LUT within the astc packing
+shared uint s_quantized_endpoints[4 * 8];
 
 
 uint quantize_to_index(float value, uint bits) {
@@ -45,32 +49,6 @@ float dequantize_from_index(uint index, uint bits) {
     if (bits == 0) return 0.0;
     float max_val = float((1 << bits) - 1);
     return float(index) / max_val;
-}
-
-/**
- * Writes N bits from a value into a 128-bit (uvec4) block
- * at a specific bit offset.
- */
-void set_bits(inout uvec4 block, uint value, uint offset, uint num_bits)
-{
-    if (num_bits == 0 || num_bits > 32) {
-        return;
-    }
-
-    uint mask = (num_bits == 32) ? 0xFFFFFFFF : (1 << num_bits) - 1;
-    uint val_masked = (value & mask);
-
-    uint dword_index = offset / 32;
-    uint bit_in_dword = offset % 32;
-
-    block[dword_index] |= (val_masked << bit_in_dword);
-
-    uint bits_in_first_dword = 32 - bit_in_dword;
-    if (bits_in_first_dword < num_bits)
-    {
-        uint overflow_bits = val_masked >> bits_in_first_dword;
-        block[dword_index + 1] |= overflow_bits;
-    }
 }
 
 uint get_bits(uvec4 block, uint offset, uint num_bits)
@@ -99,76 +77,89 @@ uint get_bits(uvec4 block, uint offset, uint num_bits)
     return value & mask;
 }
 
-
-uvec4 pack_astc_block_rgba_5_4(vec4 q_Ea, vec4 q_Eb, uint weight_base_index)
+/**
+ * Atomically writes N bits from a value into a SHARED uvec4 block within s_packed_block
+ * This allows the packing functions to parallelize the set_bits
+ */
+void set_bits_atomic_shared(uint block_idx, uint value, uint offset, uint num_bits)
 {
-    uvec4 block = uvec4(0, 0, 0, 0);
-    uint offset = 0;
-
-    set_bits(block, 0x054, 0, 11);
-    set_bits(block, 0x0, 11, 2);
-    set_bits(block, 0xD, 13, 4);
-
-    offset = 17;
-
-    uint c_indices[8];
-    c_indices[0] = quantize_to_index(q_Ea.r, 5);
-    c_indices[1] = quantize_to_index(q_Ea.g, 5);
-    c_indices[2] = quantize_to_index(q_Ea.b, 5);
-    c_indices[3] = quantize_to_index(q_Ea.a, 5);
-    c_indices[4] = quantize_to_index(q_Eb.r, 5);
-    c_indices[5] = quantize_to_index(q_Eb.g, 5);
-    c_indices[6] = quantize_to_index(q_Eb.b, 5);
-    c_indices[7] = quantize_to_index(q_Eb.a, 5);
-
-    for (uint i = 0; i < 8; i++) {
-        set_bits(block, c_indices[i], offset, 5);
-        offset += 5;
+    if (num_bits == 0 || num_bits > 32) {
+        return;
     }
 
-    offset = 128;
-    for (uint i = 0; i < 16; i++) {
-        offset -= 4;
-        uint w_idx = s_final_q_weights[weight_base_index + i];
-        set_bits(block, w_idx, offset, 4);
-    }
+    uint mask = (num_bits == 32) ? 0xFFFFFFFF : (1u << num_bits) - 1u;
+    uint val_masked = (value & mask);
+    uint dword_index = offset / 32;
+    uint bit_in_dword = offset % 32;
 
-    return block;
+    atomicOr(s_packed_block[block_idx][dword_index], (val_masked << bit_in_dword));
+
+    uint bits_in_first_dword = 32 - bit_in_dword;
+    if (bits_in_first_dword < num_bits)
+    {
+        uint overflow_bits = val_masked >> bits_in_first_dword;
+        atomicOr(s_packed_block[block_idx][dword_index + 1], overflow_bits);
+    }
 }
 
-uvec4 pack_astc_block_rgb_5_5(vec3 q_Ea_rgb, vec3 q_Eb_rgb, uint weight_base_index)
+void pack_astc_block_parallel_rgba(uint block_idx, uint weight_base_index)
 {
-    uvec4 block = uvec4(0, 0, 0, 0);
-    uint offset = 0;
+    uint pixel_idx = gl_LocalInvocationID.x;
+    uint endpoint_lut_base = block_idx * 8;
 
-    set_bits(block, 0x05C, 0, 11);
-    set_bits(block, 0x0, 11, 2);
-    set_bits(block, 0x4, 13, 4);
+    if (pixel_idx == 0) {
+        s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
+        set_bits_atomic_shared(block_idx, 0x054, 0, 11); // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_16
+        set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
+        set_bits_atomic_shared(block_idx, 0xD, 13, 4);   // [13..16] CEM = rgba_ldr
+    }
+    subgroupBarrier(); memoryBarrierShared();
 
-    offset = 17;
-
-    uint c_indices[6];
-    c_indices[0] = quantize_to_index(q_Ea_rgb.r, 5);
-    c_indices[1] = quantize_to_index(q_Ea_rgb.g, 5);
-    c_indices[2] = quantize_to_index(q_Ea_rgb.b, 5);
-    c_indices[3] = quantize_to_index(q_Eb_rgb.r, 5);
-    c_indices[4] = quantize_to_index(q_Eb_rgb.g, 5);
-    c_indices[5] = quantize_to_index(q_Eb_rgb.b, 5);
-
-    for (uint i = 0; i < 6; i++) {
-        set_bits(block, c_indices[i], offset, 5);
-        offset += 5;
+    // Threads 0-7 pack endpoint components from the LUT.
+    // [17..21], [22..26], ..x8.., [52..56] - color endpoint data (Ea.r, Ea.g, ..., Eb.b, Eb.a)
+    if (pixel_idx < 8) {
+        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
+        uint c_offset = 17 + pixel_idx * 5;
+        set_bits_atomic_shared(block_idx, c_index, c_offset, 5);
     }
 
-    offset = 128;
-    for (uint i = 0; i < 16; i++) {
-        offset -= 5;
-        uint w_idx = s_final_q_weights[weight_base_index + i];
-        set_bits(block, w_idx, offset, 5);
-    }
-
-    return block;
+    // All 16 threads pack their own weight.
+    // [124..127], [120..123], ..16x.., [64..67]  - weight data (4 bits each)
+    // thread_0  , thread_1  ,        , thread_15
+    uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
+    uint w_offset = 128 - (pixel_idx + 1) * 4;
+    set_bits_atomic_shared(block_idx, w_idx, w_offset, 4);
 }
+
+void pack_astc_block_parallel_rgb(uint block_idx, uint weight_base_index)
+{
+    uint pixel_idx = gl_LocalInvocationID.x;
+    uint endpoint_lut_base = block_idx * 8;
+
+    if (pixel_idx == 0) {
+        s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
+        set_bits_atomic_shared(block_idx, 0x05C, 0, 11); // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_32
+        set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
+        set_bits_atomic_shared(block_idx, 0x4, 13, 4);   // [13..16] CEM = rgb_ldr
+    }
+    subgroupBarrier(); memoryBarrierShared();
+
+    // Threads 0-5 pack endpoint components from the LUT.
+    // [17..21], [22..26], ..x6.., [42..46] - color endpoint data (Ea.r, Ea.g, ..., Eb.g, Eb.b)
+    if (pixel_idx < 6) {
+        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
+        uint c_offset = 17 + pixel_idx * 5;
+        set_bits_atomic_shared(block_idx, c_index, c_offset, 5);
+    }
+
+    // All 16 threads pack their own weight.
+    // [123..127], [118..122], ..16x.., [48..52]  - weight data (5 bits each)
+    // thread_0  , thread_1  ,        , thread_15
+    uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
+    uint w_offset = 128 - (pixel_idx + 1) * 5;
+    set_bits_atomic_shared(block_idx, w_idx, w_offset, 5);
+}
+
 
 void main() {
     uint pixel_idx = gl_LocalInvocationID.x; // 0..15
@@ -181,6 +172,7 @@ void main() {
     // Each thread loads a single vec4 pixel
     s_block_pixels[lane_id] = g_in_blocks[global_block_id * 16 + pixel_idx];
     vec4 my_pixel = s_block_pixels[lane_id];
+    barrier(); // Ensure every thread finishes fetching my_pixel
 
     // Endpoint Selection (AABB) via clustered subgroup min/max
     vec4 Ea = subgroupClusteredMin(my_pixel, 16);
@@ -196,26 +188,40 @@ void main() {
     // Quantization
     // bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
     bool is_transparent = subgroupOr(my_pixel.a < 0.99f); // Reduces divergence if subgroup/wavefront has heterogeneous alpha
+    // is_transparent = true;
     uint weight_bits = is_transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
-    uint final_q_weight_idx = quantize_to_index(proj, weight_bits);
-    s_final_q_weights[lane_id] = final_q_weight_idx;
+    s_final_q_weights[lane_id] = quantize_to_index(proj, weight_bits);
+
+    // Precompute the LUT for the quantied eps to avoid divergence
+    if (pixel_idx == 0) {
+        uint offset = block_idx * 8;
+        s_quantized_endpoints[offset] = quantize_to_index(Ea.r, 5); offset += 1;
+        s_quantized_endpoints[offset] = quantize_to_index(Ea.g, 5); offset += 1;
+        s_quantized_endpoints[offset] = quantize_to_index(Ea.b, 5); offset += 1;
+        if (is_transparent) {
+            s_quantized_endpoints[offset] = quantize_to_index(Ea.a, 5); offset += 1;
+        }
+        s_quantized_endpoints[offset] = quantize_to_index(Eb.r, 5); offset += 1;
+        s_quantized_endpoints[offset] = quantize_to_index(Eb.g, 5); offset += 1;
+        s_quantized_endpoints[offset] = quantize_to_index(Eb.b, 5); offset += 1;
+        if (is_transparent) {
+            s_quantized_endpoints[offset] = quantize_to_index(Eb.a, 5); offset += 1;
+        }
+    }
     barrier(); memoryBarrierShared();
 
-    // ASTC Packing (TODO)
+    // Parallel ASTC Packing
+    if (is_transparent) {
+        pack_astc_block_parallel_rgba(block_idx, block_idx * 16);
+    } else {
+        pack_astc_block_parallel_rgb(block_idx, block_idx * 16);
+    }
+    barrier();
+    memoryBarrierShared();
+
+    // Write out the packed astc to global memory
     if (pixel_idx == 0) {
-        vec4 q_Ea = Ea;
-        vec4 q_Eb = Eb;
-        uvec4 packed_block;
-
-        if (is_transparent) {
-            packed_block = pack_astc_block_rgba_5_4(q_Ea, q_Eb, lane_id);
-        } else {
-            packed_block = pack_astc_block_rgb_5_5(q_Ea.rgb, q_Eb.rgb, lane_id);
-        }
-
-        g_out_compressed_blocks[global_block_id] = packed_block;
-
-        s_packed_block[block_idx] = packed_block;
+        g_out_compressed_blocks[global_block_id] = s_packed_block[block_idx];
     }
 
     // DEBUG: write out the full encoded image as rgba8
@@ -259,6 +265,7 @@ void main() {
     }
 
     float w = dequantize_from_index(decoded_weight_idx, weight_bits);
+    // w = dequantize_from_index(s_final_q_weights[lane_id], weight_bits); // DEBUG - correct quantized pixel
 
     // LERP the final color
     vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
