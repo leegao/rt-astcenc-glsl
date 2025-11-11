@@ -11,8 +11,6 @@ The ASTC encoder (in astc_compress.comp, written in glsl) tries to do an extreme
 
 A fundamental tradeoff we'll always have to be wary of is that between color variety and color fidelity. Meaning, there's a fundamental tradeoff due to the limited block size (128b) between how many visually distinct colors you can represent within the 4x4 area versus how accurate you represent those colors.
 
-wgpu-py is used to run this shader for simplicity
-
 Demo:
 
 **Original**
@@ -81,7 +79,7 @@ This has been replaced by a pair of subgroupClusteredMin/Max operations
 
 ```glsl
     // Quantization
-    bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
+    bool is_transparent = subgroupOr(my_pixel.a < 0.99f); // Reduces divergence if subgroup/wavefront has heterogeneous alpha
     uint weight_bits = is_transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
     uint final_q_weight_idx = quantize_to_index(proj, weight_bits);
     s_final_q_weights[lane_id] = final_q_weight_idx;
@@ -111,5 +109,6 @@ This has been replaced by a pair of subgroupClusteredMin/Max operations
 2. ~Change to subgroup primitives instead of coding our own segmented reductions~
 3. Try 2-partition (using a 128kb LUT uniform ssbo)
 4. Try dual-plane (alpha-encoding channel)
+5. Try a greedy Ep selection algorithm
 
 More sophisticated tricks to increase color diversity (2-p) or fidelity (dual-plane) may not work as well due to heavier quantization needed. I'll need to prototype these in torch first to see if they even increase visual fidelity. Should not heavily regress performance however.

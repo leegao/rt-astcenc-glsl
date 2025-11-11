@@ -1,5 +1,6 @@
 #version 450
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
 
@@ -180,7 +181,6 @@ void main() {
     // Each thread loads a single vec4 pixel
     s_block_pixels[lane_id] = g_in_blocks[global_block_id * 16 + pixel_idx];
     vec4 my_pixel = s_block_pixels[lane_id];
-    float my_alpha = my_pixel.a;
 
     // Endpoint Selection (AABB) via clustered subgroup min/max
     vec4 Ea = subgroupClusteredMin(my_pixel, 16);
@@ -194,7 +194,8 @@ void main() {
     proj = clamp(proj, 0.0, 1.0);
 
     // Quantization
-    bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
+    // bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
+    bool is_transparent = subgroupOr(my_pixel.a < 0.99f); // Reduces divergence if subgroup/wavefront has heterogeneous alpha
     uint weight_bits = is_transparent ? WEIGHT_BITS_TRANS : WEIGHT_BITS_OPAQUE;
     uint final_q_weight_idx = quantize_to_index(proj, weight_bits);
     s_final_q_weights[lane_id] = final_q_weight_idx;
