@@ -10,6 +10,7 @@ const uint WEIGHT_BITS_TRANS  = 4; // RANGE_16
 layout(std140, binding = 0) uniform CParams {
     uint g_num_total_blocks;
     uint g_use_pca;
+    float g_use_secondary_direction_ratio;
 };
 
 // Input: Uncompressed pixels (B, 16, 4)
@@ -38,7 +39,6 @@ shared uvec4 s_packed_block[4];
 
 // 4 blocks * 8 endpoint channels as a LUT within the astc packing
 shared uint s_quantized_endpoints[4 * 8];
-
 
 uint quantize_to_index(float value, uint bits) {
     if (bits == 0) return 0;
@@ -178,10 +178,14 @@ vec4 YCoCg_to_RGB(vec4 ycocg) {
     return vec4(R, G, B, ycocg.w);
 }
 
-void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb) {
-    // We will do PCA within the luma space, prioritizing Y (luma) specifically
+const vec4 kYCoCgScale = vec4(1.5, 1.0, 1.0, 1.0);
+
+void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out vec4 Ec, out vec4 Ed, out bool needs_2p) {
+    // We will do 2 rounds of PCA within the luma space, prioritizing Y (luma) specifically
+    // 1st round will find the principle direction
+    // 2nd round will find the secondary direction orthogonal to the first
+    // Note that the out endpoints (E1,Eb, Ec,Ed) will be uniform within a 4x4 block
     vec4 pixel_ycocg = RGB_to_YCoCg(my_pixel);
-    const vec4 kYCoCgScale = vec4(1.5, 1.0, 1.0, 1.0); 
 
     vec4 sumPixels = subgroupClusteredAdd(pixel_ycocg, 16);
     vec4 mean = sumPixels / 16.0;
@@ -190,25 +194,97 @@ void pca_ycocg_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb) {
     vec4 centered = pixel_ycocg - mean;
     vec4 scaledCentered = centered * kYCoCgScale;
 
+    // primary PCA direction (dir1)
+    vec4 dir1 = normalize(vec4(1.0));
     // matrix-free power iteration
-    vec4 dir = normalize(vec4(1.0)); 
     for (int i = 0; i < 4; ++i) {
-        vec4 contribution = scaledCentered * dot(scaledCentered, dir);
+        vec4 contribution = scaledCentered * dot(scaledCentered, dir1);
         vec4 newDir = subgroupClusteredAdd(contribution, 16);
-        if (dot(newDir, newDir) > 1e-6) dir = normalize(newDir);
+        if (dot(newDir, newDir) > 1e-6) dir1 = normalize(newDir);
     }
 
-    float projection = dot(scaledCentered, dir);
-    float minProj = subgroupClusteredMin(projection, 16);
-    float maxProj = subgroupClusteredMax(projection, 16);
+    float projection1 = dot(scaledCentered, dir1);
+    float minProj1 = subgroupClusteredMin(projection1, 16);
+    float maxProj1 = subgroupClusteredMax(projection1, 16);
 
-    vec4 unscaledDir = dir / kYCoCgScale;
-    vec4 p1_YCoCg = mean + unscaledDir * minProj;
-    vec4 p2_YCoCg = mean + unscaledDir * maxProj;
+    vec4 unscaledDir1 = dir1 / kYCoCgScale;
+    vec4 p1_YCoCg = mean + unscaledDir1 * minProj1;
+    vec4 p2_YCoCg = mean + unscaledDir1 * maxProj1;
     
-    // Reproject back to rgb
     Ea = YCoCg_to_RGB(p1_YCoCg);
     Eb = YCoCg_to_RGB(p2_YCoCg);
+
+    if (g_use_secondary_direction_ratio >= 1.0) return; // don't use 2p mode, uniform dataflow
+
+    // secondary PCA direction (dir2)
+    vec4 dir2 = normalize(vec4(0.0, 1.0, 0.0, 0.0));
+    dir2 = normalize(dir2 - dir1 * dot(dir1, dir2)); // dir2 should be orthogonal to dir1
+
+    // adapted power iteration with gram-schmid orthogonalization
+    for (int i = 0; i < 4; ++i) {
+        vec4 contribution = scaledCentered * dot(scaledCentered, dir2);
+        vec4 newDir = subgroupClusteredAdd(contribution, 16);
+        // Gram-Schmidt: remove any dir1 component to ensure orthogonality
+        newDir = newDir - dir1 * dot(newDir, dir1);
+        if (dot(newDir, newDir) > 1e-6) dir2 = normalize(newDir);
+    }
+
+    float projection2 = dot(scaledCentered, dir2);
+    float minProj2 = subgroupClusteredMin(projection2, 16);
+    float maxProj2 = subgroupClusteredMax(projection2, 16);
+
+    vec4 unscaledDir2 = dir2 / kYCoCgScale;
+    vec4 p3_YCoCg = mean + unscaledDir2 * minProj2;
+    vec4 p4_YCoCg = mean + unscaledDir2 * maxProj2;
+
+    Ec = YCoCg_to_RGB(p3_YCoCg);
+    Ed = YCoCg_to_RGB(p4_YCoCg);
+
+    // The "length" of the primary direction and the "width" of the secondary direction
+    // We'll use this to heuristically evaluate if we need to do 2 partitions
+    float spread_PC1 = maxProj1 - minProj1;
+    float spread_PC2 = maxProj2 - minProj2;
+
+    needs_2p = (spread_PC2 / spread_PC1) >= g_use_secondary_direction_ratio;
+}
+
+vec4 get_scaled_ycocg(vec4 rgb) {
+    return RGB_to_YCoCg(rgb) * kYCoCgScale;
+}
+
+// Calculate the squared dist of a point p to the line segment (Eb-Ea)
+// by projection p onto (Eb-Ea)
+// Note we can't reuse the projection here later because this is done in YCoCg
+float get_dist_sq(vec4 p, vec4 Ea, vec4 Eb) {
+    vec4 E_delta = Eb - Ea;
+    vec4 resid = p - Ea;
+
+    float dot_delta = dot(E_delta, E_delta);
+    if (dot_delta < 1e-6) {
+        return dot(resid, resid); // distance to point a
+    }
+
+    float t = clamp(dot(resid, E_delta) / dot_delta, 0.0, 1.0);
+    vec4 proj = Ea + E_delta * t;
+    vec4 diff = p - proj;
+    return dot(diff, diff); // squared distance
+}
+
+// Returns 0 if a pixel belongs to (Ea,Eb), 1 if it belongs to (Ec,Ed)
+// Note the partitioning is also done within the scaled ycocg space
+int partition_pixel_subset(vec4 pixel_rgb, vec4 Ea_rgb, vec4 Eb_rgb, vec4 Ec_rgb, vec4 Ed_rgb) 
+{
+    vec4 p_scaled = get_scaled_ycocg(pixel_rgb);
+    vec4 a_scaled = get_scaled_ycocg(Ea_rgb);
+    vec4 b_scaled = get_scaled_ycocg(Eb_rgb);
+    vec4 c_scaled = get_scaled_ycocg(Ec_rgb);
+    vec4 d_scaled = get_scaled_ycocg(Ed_rgb);
+
+    float dist1_sq = get_dist_sq(p_scaled, a_scaled, b_scaled);
+    float dist2_sq = get_dist_sq(p_scaled, c_scaled, d_scaled);
+
+    // Return the index of the closer color spectrum/line
+    return (dist2_sq < dist1_sq) ? 1 : 0;
 }
 
 void main() {
@@ -224,21 +300,38 @@ void main() {
     vec4 my_pixel = s_block_pixels[lane_id];
     barrier(); // Ensure every thread finishes fetching my_pixel
 
-    // Endpoint Selection (AABB) via clustered subgroup min/max
-    vec4 Ea, Eb;
+    // Endpoint Selection (for two partitions).
+    // (Ea,Eb) - primary partition endpoints
+    // (Ec,Ed) - secondary partition endpoints
+    vec4 Ea, Eb, Ec, Ed;
+    bool needs_2p = false;
     if (g_use_pca > 0) {
-        pca_ycocg_endpoint_selection(my_pixel, Ea, Eb);
+        pca_ycocg_endpoint_selection(my_pixel, Ea, Eb, Ec, Ed, needs_2p);
     } else {
+        // Use subgroup clustered AABB operations to compute the endpoints
+        // never use 2 partitions here
         Ea = subgroupClusteredMin(my_pixel, 16);
         Eb = subgroupClusteredMax(my_pixel, 16);
     }
 
-    // Weight calculation via projection onto Eb-Ea
+    // Weight calculation via projection onto Eb-Ea (proj1) and Ed-Ec (proj2)
     vec4 E_delta = Eb - Ea;
     float dot_delta = dot(E_delta, E_delta) + 1e-9f;
-    vec4 P = s_block_pixels[lane_id];
-    float proj = dot(P - Ea, E_delta) / dot_delta;
-    proj = clamp(proj, 0.0, 1.0);
+    float proj1 = clamp(dot(my_pixel - Ea, E_delta) / dot_delta, 0.0, 1.0);
+    E_delta = Ed - Ec;
+    dot_delta = dot(E_delta, E_delta) + 1e-9f;
+    float proj2 = clamp(dot(my_pixel - Ec, E_delta) / dot_delta, 0.0, 1.0);
+
+    // Ideal partition map calculation
+    float proj = proj1;
+    if (needs_2p) { // This is an expensive O(100) divergence, but can't be optimized away
+        uint idx = partition_pixel_subset(my_pixel, Ea, Eb, Ec, Ed) == 0 ? pixel_idx : 0;
+        uint ideal_partition_0_idx = subgroupClusteredOr(1 << idx, 16);
+
+        // TODO: needs_2p handling
+        // We have the 2 partition eps, an ideal partition map, and the weight projections into both eps
+        // We need to snap the ideal partition map to a valid astc partition index, then encode the 2P variant
+    }
 
     // Quantization
     // bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
@@ -263,7 +356,8 @@ void main() {
             s_quantized_endpoints[offset] = quantize_to_index(Eb.a, 5); offset += 1;
         }
     }
-    barrier(); memoryBarrierShared();
+    barrier();
+    memoryBarrierShared();
 
     // Parallel ASTC Packing
     if (is_transparent) {
@@ -320,7 +414,7 @@ void main() {
     }
 
     float w = dequantize_from_index(decoded_weight_idx, weight_bits);
-    // w = dequantize_from_index(s_final_q_weights[lane_id], weight_bits); // DEBUG - correct quantized pixel
+    // w = dequantize_from_index(s_final_q_weights[lane_id], weight_bits); // DEBUG - original quantized pixel
 
     // LERP the final color
     vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
