@@ -71,6 +71,7 @@ layout(binding = 5) uniform usamplerBuffer g_lut_seed_to_mask;
 shared vec4 s_block_pixels[64];
 
 // 4 blocks * 16 final quantized weight indices
+// TODO: remove since this is now thread-local
 shared uint s_final_q_weights[64];
 
 // 4 blocks * 128b (4 uvecs) for the final packed astc block
@@ -175,7 +176,7 @@ uint block_mode_p2(uint color_bits) {
     return (color_mode << 2) | 0x01;
 }
 
-
+// TODO: refactor into a single function (since the shader compiler will likely inline this anyways)
 void pack_astc_block_parallel_rgba(uint block_idx, uint weight_base_index)
 {
     uint pixel_idx = gl_LocalInvocationID.x;
@@ -315,7 +316,7 @@ void pack_astc_block_parallel_2p_rgb(uint block_idx, uint weight_base_index, uin
 }
 
 void pca_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out vec4 Ec, out vec4 Ed, out bool needs_2p) {
-    // We will do 2 rounds of PCA within the luma space, prioritizing Y (luma) specifically
+    // We will do 2 rounds of PCA
     // 1st round will find the principle direction
     // 2nd round will find the secondary direction orthogonal to the first
     // Note that the out endpoints (E1,Eb, Ec,Ed) will be uniform within a 4x4 block
@@ -429,9 +430,7 @@ void main() {
     vec4 E_delta = Eb - Ea;
     float dot_delta = dot(E_delta, E_delta) + 1e-9f;
     float proj1 = clamp(dot(my_pixel - Ea, E_delta) / dot_delta, 0.0, 1.0);
-    E_delta = Ed - Ec;
-    dot_delta = dot(E_delta, E_delta) + 1e-9f;
-    float proj2 = clamp(dot(my_pixel - Ec, E_delta) / dot_delta, 0.0, 1.0);
+    float proj2;
 
     // Ideal partition map calculation
     float proj = proj1;
@@ -451,13 +450,16 @@ void main() {
         // TODO: check the L1/hamming distance to ideal mask, and unset needs_2p if > 2
         my_final_partition = (final_partition_mask >> pixel_idx) & 1u;
 
+        E_delta = Ed - Ec;
+        dot_delta = dot(E_delta, E_delta) + 1e-9f;
+        proj2 = clamp(dot(my_pixel - Ec, E_delta) / dot_delta, 0.0, 1.0);
+
         proj = (my_final_partition == 0) ? proj1 : proj2;
     }
 
     // Quantization
     // bool is_transparent = subgroupClusteredOr(my_alpha < 0.99f, 16);
     bool is_transparent = subgroupOr(my_pixel.a < 0.99f); // Reduces divergence if subgroup/wavefront has heterogeneous alpha
-    // is_transparent = true;
 
     // for partitions=2, weights are R8, otherwise, rgba is R16 while rgb is R32
     uint weight_bits = needs_2p ? (is_transparent ? WEIGHT_BITS_RGBA_2P : WEIGHT_BITS_RGB_2P) : (is_transparent ? WEIGHT_BITS_RGBA_1P : WEIGHT_BITS_RGB_1P);
@@ -518,78 +520,41 @@ void main() {
 
     #define DECODE_EP_COMPONENT() dequantize_from_index(get_bits(my_packed_block, decode_offset, decode_ep_bits), decode_ep_bits); decode_offset += decode_ep_bits
     #define DECODE_EP_RGB(x) x.r = DECODE_EP_COMPONENT(); x.g = DECODE_EP_COMPONENT(); x.b = DECODE_EP_COMPONENT(); x.a = 1.0f
-    #define DECODE_EP_RGBA(x) x.r = DECODE_EP_COMPONENT(); x.g = DECODE_EP_COMPONENT(); x.b = DECODE_EP_COMPONENT(); x.a = DECODE_EP_COMPONENT()
+    #define DECODE_EP(x) x.r = DECODE_EP_COMPONENT(); x.g = DECODE_EP_COMPONENT(); x.b = DECODE_EP_COMPONENT(); if (is_transparent) { x.a = DECODE_EP_COMPONENT(); } else { x.a = 1.0f; }
     if (needs_2p) {
         decode_offset = 27;
         uint decoded_seed = get_bits(my_packed_block, 17, 10);
         uint decoded_mask = texelFetch(g_lut_seed_to_mask, int(decoded_seed)).r;
         decoded_partition = (decoded_mask >> pixel_idx) & 1u;
+        // Decode 2P RGB(A) block
+        // Endpoints: 12/16 channels * N bits @ offset 27
+        DECODE_EP(decoded_Ea);
+        DECODE_EP(decoded_Eb);
+        DECODE_EP(decoded_Ec);
+        DECODE_EP(decoded_Ed);
 
-
-        if (is_transparent) {
-            // Decode 2P RGBA block (R8/R8, 3-bit/3-bit)
-            // Endpoints: 16 channels * 3 bits = 48 bits @ offset 27
-            DECODE_EP_RGBA(decoded_Ea);
-            DECODE_EP_RGBA(decoded_Eb);
-            DECODE_EP_RGBA(decoded_Ec);
-            DECODE_EP_RGBA(decoded_Ed);
-
-            // Weights: 16 weights * 3 bits = 48 bits @ offset 80
-            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
-
-        } else {
-            // Decode 2P RGB block (R32/R8, 4-bit/3-bit)
-            // Endpoints: 12 channels * 5 bits = 60 bits @ offset 27
-            DECODE_EP_RGB(decoded_Ea);
-            DECODE_EP_RGB(decoded_Eb);
-            DECODE_EP_RGB(decoded_Ec);
-            DECODE_EP_RGB(decoded_Ed);
-
-            // Weights: 16 weights * 3 bits = 48 bits @ offset 80
-            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
-        }
-
-        // No quantization test
-        // decoded_Ea = Ea;
-        // decoded_Eb = Eb;
-        // decoded_Ec = Ec;
-        // decoded_Ed = Ed;
-        // weight_bits = 8;
-        // decoded_partition = (ideal_map_int >> pixel_idx) & 1u;
-        // decoded_weight_idx = quantize_to_index(decoded_partition == 0 ? proj1 : proj2, weight_bits);
-
-        if (decoded_partition == 1) {
-            decoded_Ea = decoded_Ec;
-            decoded_Eb = decoded_Ed;
-        }
+        // Weights: 16 weights * M bits
+        uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
+        decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
     } else {
         decode_offset = 17;
-        if (is_transparent) {
-            // Decode RGBA block (R32/R16, 5-bit/4-bit)
-            // Endpoints: 8 channels * 5 bits = 40 bits @ offset 17
-            DECODE_EP_RGBA(decoded_Ea);
-            DECODE_EP_RGBA(decoded_Eb);
+        // Decode RGB(A) block
+        // Endpoints: 6/8 channels * N @ offset 17
+        DECODE_EP(decoded_Ea);
+        DECODE_EP(decoded_Eb);
 
-            // Weights: 16 weights * 4 bits = 64 bits @ offset 64
-            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
-        } else {
-            // Decode RGB block (R32/R32, 5-bit/5-bit)
-            // Endpoints: 6 channels * 5 bits = 30 bits @ offset 17
-            DECODE_EP_RGB(decoded_Ea);
-            DECODE_EP_RGB(decoded_Eb);
-
-            // Weights: 16 weights * 5 bits = 80 bits @ offset 48
-            uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
-            decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
-        }
+        // Weights: 16 weights * M bits
+        uint weight_offset = 128 - (pixel_idx + 1) * weight_bits;
+        decoded_weight_idx = get_bits(my_packed_block, weight_offset, weight_bits);
     }
 
+    if (decoded_partition == 1) {
+        decoded_Ea = decoded_Ec;
+        decoded_Eb = decoded_Ed;
+    }
 
+    // No quantization quality test
     // if (true) {
-    //     // No quantization test
     //     // decoded_Ea = Ea;
     //     // decoded_Eb = Eb;
     //     // decoded_Ec = Ec;
@@ -603,6 +568,8 @@ void main() {
 
     // LERP the final color
     vec4 final_color = mix(decoded_Ea, decoded_Eb, w);
+
+    // Highlight 2p blocks
     // if (needs_2p) {
     //     if (decoded_partition == 0) {
     //         final_color = mix(final_color, vec4(0.0, 1.0, 0.0, 1.0), 0.15);
@@ -615,5 +582,6 @@ void main() {
     //         return;
     //     }
     // }
+
     g_out_decoded_pixels[global_block_id * 16 + pixel_idx] = final_color;
 }
