@@ -70,15 +70,8 @@ layout(binding = 5) uniform usamplerBuffer g_lut_seed_to_mask;
 // 4 blocks * 16 pixels/block = 64 pixels
 shared vec4 s_block_pixels[64];
 
-// 4 blocks * 16 final quantized weight indices
-// TODO: remove since this is now thread-local
-shared uint s_final_q_weights[64];
-
 // 4 blocks * 128b (4 uvecs) for the final packed astc block
 shared uvec4 s_packed_block[4];
-
-// 4 blocks * 8 endpoint channels as a LUT within the astc packing
-shared uint s_quantized_endpoints[4 * 16];
 
 uint quantize_to_index(float value, uint bits) {
     if (bits == 0) return 0;
@@ -176,143 +169,42 @@ uint block_mode_p2(uint color_bits) {
     return (color_mode << 2) | 0x01;
 }
 
-// TODO: refactor into a single function (since the shader compiler will likely inline this anyways)
-void pack_astc_block_parallel_rgba(uint block_idx, uint weight_base_index)
-{
-    uint pixel_idx = gl_LocalInvocationID.x;
-    uint endpoint_lut_base = block_idx * 16;
-
-    if (pixel_idx == 0) {
-        s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
-        // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_16
-        set_bits_atomic_shared(block_idx, block_mode_p1(COLOR_BITS_RGBA_1P, WEIGHT_BITS_RGBA_1P), 0, 11);
-        set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
-        set_bits_atomic_shared(block_idx, 0xD, 13, 4);   // [13..16] CEM = rgba_ldr
-    }
-    subgroupBarrier(); memoryBarrierShared();
-
-    // Threads 0-7 pack endpoint components from the LUT.
-    // [17..21], [22..26], ..x8.., [52..56] - color endpoint data (Ea.r, Ea.g, ..., Eb.b, Eb.a)
-    if (pixel_idx < 8) {
-        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 17 + pixel_idx * COLOR_BITS_RGBA_1P;
-        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGBA_1P);
-    }
-
-    // All 16 threads pack their own weight.
-    // [124..127], [120..123], ..16x.., [64..67]  - weight data (4 bits each)
-    // thread_0  , thread_1  ,        , thread_15
-    uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGBA_1P;
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGBA_1P);
-}
-
-void pack_astc_block_parallel_rgb(uint block_idx, uint weight_base_index)
-{
-    uint pixel_idx = gl_LocalInvocationID.x;
-    uint endpoint_lut_base = block_idx * 16;
-
-    if (pixel_idx == 0) {
-        s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
-        set_bits_atomic_shared(block_idx, block_mode_p1(COLOR_BITS_RGB_1P, WEIGHT_BITS_RGB_1P), 0, 11); // [00..10] 4x4, color_q=RANGE_32, weight_q=RANGE_32
-        set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
-        set_bits_atomic_shared(block_idx, 0x4, 13, 4);   // [13..16] CEM = rgb_ldr
-    }
-    subgroupBarrier(); memoryBarrierShared();
-
-    // Threads 0-5 pack endpoint components from the LUT.
-    // [17..21], [22..26], ..x6.., [42..46] - color endpoint data (Ea.r, Ea.g, ..., Eb.g, Eb.b)
-    if (pixel_idx < 6) {
-        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 17 + pixel_idx * COLOR_BITS_RGB_1P;
-        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGB_1P);
-    }
-
-    // All 16 threads pack their own weight.
-    // [123..127], [118..122], ..16x.., [48..52]  - weight data (5 bits each)
-    // thread_0  , thread_1  ,        , thread_15
-    uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGB_1P;
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGB_1P);
-}
-
 /**
- * Packs a 2-partition, 4x4 RGBA block.
- * Uses 3-bit endpoints (RANGE_8) and 3-bit weights (RANGE_8).
- * Block mode 0x010.
+ * Packs a 4x4 RGB block (1/2)-partition, rgb(a) block using color_bits, weight_bits quantization
  */
-void pack_astc_block_parallel_2p_rgba(uint block_idx, uint weight_base_index, uint astc_seed)
+void pack_astc_block_parallel(uint w_index, uint c_index, uint components, bool use_p2, uint color_bits, uint weight_bits, bool use_rgba, uint astc_seed)
 {
     uint pixel_idx = gl_LocalInvocationID.x;
-    // We need 16 channels for 2P RGBA: (Ea.rgba, Eb.rgba, Ec.rgba, Ed.rgba)
-    uint endpoint_lut_base = block_idx * 16; 
+    uint block_idx = gl_LocalInvocationID.y;
+    uint endpoint_lut_base = block_idx * 16;
+    uint offset = use_p2 ? 27 : 17;
 
     if (pixel_idx == 0) {
         s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
-        // [00..10] Block Mode: 4x4, 2-part, R8 color, R8 weight
-        set_bits_atomic_shared(block_idx, block_mode_p2(COLOR_BITS_RGBA_2P), 0, 11); 
-        // [11..12] Partitions: 1 (for 2 partitions)
-        set_bits_atomic_shared(block_idx, 0x1, 11, 2);   
-        // [13..16] CEM: 0xD (rgba_ldr)
-        set_bits_atomic_shared(block_idx, 0xD, 13, 4);   
-        // [17..26] Partition Seed (10 bits)
-        set_bits_atomic_shared(block_idx, astc_seed, 17, 10); 
+        uint CEM = use_rgba ? 0xD /* rgba_ldr */ : 0x4 /* rgb_ldr */;
+        if (!use_p2) {
+            set_bits_atomic_shared(block_idx, block_mode_p1(color_bits, weight_bits), 0, 11); // [0..10] Block Mode
+            set_bits_atomic_shared(block_idx, 0x0, 11, 2);   // [11..12] partitions = 1
+            set_bits_atomic_shared(block_idx, CEM, 13, 4);   // [13..16] CEM
+        } else {
+            set_bits_atomic_shared(block_idx, block_mode_p2(color_bits), 0, 11); // [00..10] Block Mode
+            set_bits_atomic_shared(block_idx, 0x1, 11, 2);   // [11..12] partitions = 2
+            set_bits_atomic_shared(block_idx, CEM, 13, 4);   // [13..16] CEM
+            set_bits_atomic_shared(block_idx, astc_seed, 17, 10); // [17..26] Partition Seed (10 bits)
+        }
     }
-    subgroupBarrier(); memoryBarrierShared();
+    subgroupBarrier();
+    memoryBarrierShared();
 
-    // Pack Endpoints: 2 partitions * 2 endpoints * 4 channels = 16 channels
-    // 16 channels * 3 bits/channel = 48 bits. Starts at bit 27.
-    // All 16 threads pack one channel each.
-    if (pixel_idx < 16) {
-        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 27 + pixel_idx * COLOR_BITS_RGBA_2P; // 3 bits per channel
-        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGBA_2P);
+    // First #components threads pack color endpoint components from the LUT.
+    if (pixel_idx < components) {
+        uint c_offset = offset + pixel_idx * color_bits;
+        set_bits_atomic_shared(block_idx, c_index, c_offset, color_bits);
     }
-    
-    // Pack Weights: 16 pixels * 3 bits/weight = 48 bits
-    // Starts at bit (128 - 48) = 80
-    uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGBA_2P; // 3 bits each
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGBA_2P);
-}
-/**
- * Packs a 2-partition, 4x4 RGB block.
- * Uses 4-bit endpoints (RANGE_16) and 3-bit weights (RANGE_8).
- * Block mode 0x011.
- */
-void pack_astc_block_parallel_2p_rgb(uint block_idx, uint weight_base_index, uint astc_seed)
-{
-    uint pixel_idx = gl_LocalInvocationID.x;
-    // We need 12 channels for 2P RGB: (Ea.rgb, Eb.rgb, Ec.rgb, Ed.rgb)
-    uint endpoint_lut_base = block_idx * 16; // Use 16-wide LUT, threads 12-15 idle
 
-    if (pixel_idx == 0) {
-        s_packed_block[block_idx] = uvec4(0, 0, 0, 0);
-        // [00..10] Block Mode: 4x4, 2-part, R16 color, R8 weight
-        set_bits_atomic_shared(block_idx, block_mode_p2(COLOR_BITS_RGB_2P), 0, 11); 
-        // [11..12] Partitions: 1 (for 2 partitions)
-        set_bits_atomic_shared(block_idx, 0x1, 11, 2);   
-        // [13..16] CEM: 0x4 (rgb_ldr)
-        set_bits_atomic_shared(block_idx, 0x4, 13, 4);   
-        // [17..26] Partition Seed (10 bits)
-        set_bits_atomic_shared(block_idx, astc_seed, 17, 10); 
-    }
-    subgroupBarrier(); memoryBarrierShared();
-
-    // Pack Endpoints: 2 partitions * 2 endpoints * 3 channels = 12 channels
-    // 12 channels * 4 bits/channel = 48 bits. Starts at bit 27.
-    // Threads 0-11 pack one channel each.
-    if (pixel_idx < 12) {
-        uint c_index = s_quantized_endpoints[endpoint_lut_base + pixel_idx];
-        uint c_offset = 27 + pixel_idx * COLOR_BITS_RGB_2P; // 4 bits per channel
-        set_bits_atomic_shared(block_idx, c_index, c_offset, COLOR_BITS_RGB_2P);
-    }
-    
-    // Pack Weights: 16 pixels * 3 bits/weight = 48 bits
-    // Starts at bit (128 - 48) = 80
-    uint w_idx = s_final_q_weights[weight_base_index + pixel_idx];
-    uint w_offset = 128 - (pixel_idx + 1) * WEIGHT_BITS_RGB_2P; // 3 bits each
-    set_bits_atomic_shared(block_idx, w_idx, w_offset, WEIGHT_BITS_RGB_2P);
+    // All 16 threads pack their own weights
+    uint w_offset = 128 - (pixel_idx + 1) * weight_bits;
+    set_bits_atomic_shared(block_idx, w_index, w_offset, weight_bits);
 }
 
 void pca_endpoint_selection(vec4 my_pixel, out vec4 Ea, out vec4 Eb, out vec4 Ec, out vec4 Ed, out bool needs_2p) {
@@ -464,40 +356,20 @@ void main() {
     // for partitions=2, weights are R8, otherwise, rgba is R16 while rgb is R32
     uint weight_bits = needs_2p ? (is_transparent ? WEIGHT_BITS_RGBA_2P : WEIGHT_BITS_RGB_2P) : (is_transparent ? WEIGHT_BITS_RGBA_1P : WEIGHT_BITS_RGB_1P);
     uint color_bits = needs_2p ? (is_transparent ? COLOR_BITS_RGBA_2P : COLOR_BITS_RGB_2P) : (is_transparent ? COLOR_BITS_RGBA_1P : COLOR_BITS_RGB_1P);
-    s_final_q_weights[lane_id] = quantize_to_index(proj, weight_bits);
+    uint quantized_weight = quantize_to_index(proj, weight_bits);
 
-    // Precompute the LUT for the quantied eps to avoid divergence
-    if (pixel_idx == 0) {
-        #define SET_EP_COMPONENT(x) { s_quantized_endpoints[offset] = quantize_to_index(x, color_bits); offset++; }
-        #define SET_EP(x) SET_EP_COMPONENT(x.r); SET_EP_COMPONENT(x.g); SET_EP_COMPONENT(x.b); \
-            if (is_transparent) SET_EP_COMPONENT(Ea.a)
-        uint offset = block_idx * 16; // 16 entries per block
-        SET_EP(Ea);
-        SET_EP(Eb);
-        if (needs_2p) {
-            SET_EP(Ec);
-            SET_EP(Ed);
-        }
-        #undef SET_EP
-        #undef SET_EP_COMPONENT
+    // Quantize the color endpoints
+    vec4[6] endpoints = {Ea, Eb, Ec, Ed, vec4(0), vec4(0)};
+    uint divisor = is_transparent ? 4 : 3; // pack rgba,rgba,rgba,rgba or rgb,rgb,rgb,rgb
+    float my_endpoint_component = endpoints[pixel_idx / divisor][pixel_idx % divisor];
+    uint components = !needs_2p ? (is_transparent ? 8 : 6) : (is_transparent ? 16 : 12);
+    uint quantized_color;
+    if (pixel_idx < components) {
+        quantized_color = quantize_to_index(my_endpoint_component, color_bits);
     }
-    barrier();
-    memoryBarrierShared();
 
     // Parallel ASTC Packing
-    if (is_transparent) {
-        if (needs_2p) {
-            pack_astc_block_parallel_2p_rgba(block_idx, block_idx * 16, astc_seed);
-        } else {
-            pack_astc_block_parallel_rgba(block_idx, block_idx * 16);
-        }
-    } else {
-        if (needs_2p) {
-            pack_astc_block_parallel_2p_rgb(block_idx, block_idx * 16, astc_seed);
-        } else {
-            pack_astc_block_parallel_rgb(block_idx, block_idx * 16);
-        }
-    }
+    pack_astc_block_parallel(quantized_weight, quantized_color, components, needs_2p, color_bits, weight_bits, is_transparent, astc_seed);
     barrier();
     memoryBarrierShared();
 
