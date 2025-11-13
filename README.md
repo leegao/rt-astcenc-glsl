@@ -13,17 +13,40 @@ A fundamental tradeoff we'll always have to be wary of is that between color var
 
 ### Demo
 
+#### Screenshot 1
+
 **Original**
 ![screenshot.jpg](screenshot.jpg)
 
-**ASTC Encoded**
+**ASTC Encoded w/ naive aabb fast mode**
+![decoded_screenshot.png](decoded_screenshot_aabb.jpg)
+
+**ASTC Encoded w/ PCA+2P optimization**
 ![decoded_screenshot.png](decoded_screenshot.jpg)
 
-**Original**
-![screenshot.jpg](pixelzombie.jpg)
+#### Screenshot 2
 
-**ASTC Encoded**
-![decoded_screenshot.png](decoded_pixelzombie.jpg)
+**Original**
+![pixelzombie.jpg](pixelzombie.jpg)
+
+**ASTC Encoded w/ naive aabb fast mode**
+![decoded_pixelzombie.png](decoded_pixelzombie_aabb.jpg)
+
+**ASTC Encoded w/ PCA+2P optimization**
+![decoded_pixelzombie.png](decoded_pixelzombie.jpg)
+
+#### High/Low Frequency Example
+
+**Original**
+![example.jpg](example.jpg)
+
+**ASTC Encoded w/ naive aabb fast mode**
+![decoded_example.jpn](decoded_example_aabb.jpg)
+
+**ASTC Encoded w/ PCA+2P optimization**
+![decoded_example.png](decoded_example.jpg)
+
+#### Runtime
 
 **With parallelized astc packing**
 
@@ -175,6 +198,6 @@ See ![astc2pseeds.png](astc2pseeds.png)
 4. Try dual-plane (alpha-encoding channel)
 5. ~Try a greedy Ep selection algorithm~ - not needed
 6. ~Add parallelized astc format packing~
-7. Try doing mode search for smoother gradients in the p=1 regime
+7. ~Try doing mode search for smoother gradients in the p=1 regime~
 
 More sophisticated tricks to increase color diversity (2-p) or fidelity (dual-plane) may not work as well due to heavier quantization needed. I'll need to prototype these in torch first to see if they even increase visual fidelity. Should not heavily regress performance however.

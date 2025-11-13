@@ -757,7 +757,8 @@ public:
         memcpy(compressedResult.data(), mappedMemory, compressedBufferSize);
         vkUnmapMemory(device, readbackCompressedMemory);
         compressedResult.resize(imageData.totalBlocks * 4);
-        save_astc_file("output.astc", compressedResult, imageData.originalWidth, imageData.originalHeight);
+        auto output_astc_file = std::string("decoded_") + input_file + ".astc";
+        save_astc_file(output_astc_file.c_str(), compressedResult, imageData.originalWidth, imageData.originalHeight);
         
         std::cout << "Reading back decoded data..." << std::endl;
         vkMapMemory(device, readbackDecodedMemory, 0, decodedBufferSize, 0, &mappedMemory);
@@ -811,6 +812,8 @@ int main() {
     ASTCComputeApp app;
     try {
         app.run("screenshot.jpg");
+        app.run("pixelzombie.jpg");
+        app.run("example.jpg");
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
